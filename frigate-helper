@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ---------------------------
-# Frigate Helper Script v8.0
-# Automatische Template-Erkennung (Debian 12)
+# Frigate Helper Script v9.0
+# Automatische Template-Erkennung (Debian 12) ohne jq
 # ---------------------------
 
 FRIGATE_DIR="/opt/frigate"
@@ -56,20 +56,13 @@ echo "Klonen des öffentlichen Repos..."
 git clone https://github.com/sebrosch/$GITHUB_REPO.git "$FRIGATE_DIR" --branch main
 chmod +x "$FRIGATE_DIR/frigate-helper"
 
-# LXC Template automatisch suchen
+# Storage Standardwert setzen
 if [ -z "$STORAGE" ]; then
-    # Suche alle verfügbaren Storages
-    for s in $(pvesh get /storage | jq -r '.[].storage'); do
-        TPL=$(ls /var/lib/vz/template/cache/ 2>/dev/null | grep 'debian-12-standard.*\.tar\.zst' | head -n1)
-        if [ ! -z "$TPL" ]; then
-            STORAGE="$s"
-            TEMPLATE="$TPL"
-            break
-        fi
-    done
-else
-    TEMPLATE=$(ls /var/lib/vz/template/cache/ 2>/dev/null | grep 'debian-12-standard.*\.tar\.zst' | head -n1)
+    STORAGE="local"
 fi
+
+# LXC Template automatisch suchen
+TEMPLATE=$(ls /var/lib/vz/template/cache/ | grep 'debian-12-standard.*\.tar\.zst' | head -n1)
 
 if [ -z "$TEMPLATE" ]; then
     echo "Fehler: Kein Debian 12 Template gefunden. Bitte ein Template unter /var/lib/vz/template/cache/ ablegen."
