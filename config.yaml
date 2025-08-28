@@ -1,0 +1,22 @@
+mqtt:
+  host: 192.168.1.10      # IP deines MQTT-Servers
+  user: mqttuser          # Benutzername für MQTT
+  password: mqttpass      # Passwort für MQTT
+
+cameras:
+  haustuer:
+    ffmpeg:
+      inputs:
+        - path: rtsp://user:pass@192.168.1.20:554/stream1
+          roles:
+            - detect
+            - rtmp
+    detect:
+      width: 1920
+      height: 1080
+      fps: 5
+
+objects:
+  track:
+    - person
+    - car
