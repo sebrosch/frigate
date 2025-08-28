@@ -1,117 +1,68 @@
 #!/bin/bash
+# Frigate Helper für Proxmox LXC
+# Version: 2.0
+# Autor: angepasst für interaktive Template- und Storage-Auswahl
 
-# ---------------------------
-# Frigate Helper Script v9.0
-# Automatische Template-Erkennung (Debian 12) ohne jq
-# ---------------------------
+set -e
 
 FRIGATE_DIR="/opt/frigate"
-GITHUB_REPO="frigate"
-ACTION=""
+CONTAINER_NAME="frigate"
+CTID=$(pvesh get /cluster/nextid)
+TEMPLATE_DIR="/var/lib/vz/template/cache"
 
-show_help() {
-    echo "Usage: $0 create [--storage STORAGE_NAME]"
-    echo ""
-    echo "Options:"
-    echo "  --storage STORAGE_NAME   Wähle den Proxmox Storage für den Container (optional)"
-    echo "  --help                   Zeigt dieses Hilfemenü"
-    exit 0
-}
-
-# Parameter auslesen
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        --storage)
-            STORAGE="$2"
-            shift 2
-            ;;
-        --help)
-            show_help
-            ;;
-        create)
-            ACTION="create"
-            shift
-            ;;
-        *)
-            echo "Unbekannte Option: $1"
-            show_help
-            ;;
-    esac
-done
-
-if [[ "$ACTION" != "create" ]]; then
-    show_help
+# Prüfen, ob jq installiert ist
+if ! command -v jq &>/dev/null; then
+    echo "jq wird benötigt, installiere..."
+    apt update && apt install -y jq
 fi
 
-echo "=== Starte Frigate Installation ==="
-
-# Prüfen /opt/frigate
+# Alte Version entfernen
 if [ -d "$FRIGATE_DIR" ]; then
-    echo "Altes /opt/frigate Verzeichnis gefunden, lösche es..."
+    echo "Altes $FRIGATE_DIR Verzeichnis gefunden, lösche es..."
     rm -rf "$FRIGATE_DIR"
 fi
 
-# Repo klonen (öffentlich)
-echo "Klonen des öffentlichen Repos..."
-git clone https://github.com/sebrosch/$GITHUB_REPO.git "$FRIGATE_DIR" --branch main
+# Repo klonen
+git clone https://github.com/sebrosch/frigate.git "$FRIGATE_DIR" --branch main
 chmod +x "$FRIGATE_DIR/frigate-helper"
 
-# Storage Standardwert setzen
-if [ -z "$STORAGE" ]; then
-    STORAGE="local"
-fi
+# Debian Templates auflisten
+echo "Verfügbare Debian-Templates:"
+templates=($(ls $TEMPLATE_DIR/debian-*-standard_*.tar.zst 2>/dev/null))
+select TEMPLATE in "${templates[@]}"; do
+    if [ -n "$TEMPLATE" ]; then
+        echo "Gewähltes Template: $TEMPLATE"
+        break
+    fi
+done
 
-# LXC Template automatisch suchen
-TEMPLATE=$(ls /var/lib/vz/template/cache/ | grep 'debian-12-standard.*\.tar\.zst' | head -n1)
-
-if [ -z "$TEMPLATE" ]; then
-    echo "Fehler: Kein Debian 12 Template gefunden. Bitte ein Template unter /var/lib/vz/template/cache/ ablegen."
-    exit 1
-fi
-
-echo "Verwende Storage: $STORAGE"
-echo "Verwende Template: $TEMPLATE"
-
-# CTID ermitteln
-NEXT_CID=$(pvesh get /cluster/nextid)
-echo "CTID: $NEXT_CID"
-
-# Prüfen, ob Container existiert
-if pct status $NEXT_CID &>/dev/null; then
-    echo "Alter Container mit CTID $NEXT_CID gefunden, lösche ihn..."
-    pct stop $NEXT_CID
-    pct destroy $NEXT_CID
-fi
+# Storage auswählen
+storages=($(pvesh get /storage --output-format=json | jq -r '.[].storage'))
+echo "Verfügbare Storage:"
+select STORAGE in "${storages[@]}"; do
+    if [ -n "$STORAGE" ]; then
+        echo "Gewählter Storage: $STORAGE"
+        break
+    fi
+done
 
 # Container erstellen
-echo "Erstelle Container..."
-pct create $NEXT_CID "/var/lib/vz/template/cache/$TEMPLATE" \
-    --storage $STORAGE \
-    --hostname frigate \
-    --cores 2 \
-    --memory 4096 \
-    --net0 name=eth0,bridge=vmbr0,ip=dhcp \
-    --unprivileged 1 \
-    --features nesting=1 \
-    --ostype debian \
-    --password 'changeme'
+echo "Erstelle Container CTID $CTID auf Storage $STORAGE mit Template $TEMPLATE..."
+pct create $CTID "$TEMPLATE" -storage "$STORAGE" -hostname "$CONTAINER_NAME" -net0 name=eth0,bridge=vmbr0,ip=dhcp -cores 2 -memory 2048 -features nesting=1
+pct start $CTID
 
-pct start $NEXT_CID
-
-# Docker & Git installieren
+# Docker installieren
 echo "Installiere Docker im Container..."
-pct exec $NEXT_CID -- bash -c "apt update && apt install -y docker.io docker-compose git"
+pct exec $CTID -- bash -c "apt update && apt install -y docker.io"
 
-# Verzeichnisse für Frigate
-pct exec $NEXT_CID -- mkdir -p /opt/frigate/config /opt/frigate/media
+# Frigate starten (im Container)
+echo "Starte Frigate im Container..."
+pct exec $CTID -- bash -c "docker run -d --name frigate --restart=unless-stopped -p 5000:5000 -v /etc/frigate:/config blakeblackshear/frigate:stable"
 
-# Frigate starten
-pct exec $NEXT_CID -- /opt/frigate/frigate-helper start
-
-# Container-IP ausgeben
-IP=$(pct exec $NEXT_CID -- hostname -I | awk '{print $1}')
+# IP anzeigen
+IP=$(pct exec $CTID -- hostname -I | awk '{print $1}')
 echo "-----------------------------------"
 echo "Frigate läuft im Container!"
 echo "Zugriff: http://$IP:5000"
-echo "CTID: $NEXT_CID"
+echo "CTID: $CTID"
 echo "-----------------------------------"
