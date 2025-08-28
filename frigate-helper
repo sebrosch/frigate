@@ -1,8 +1,7 @@
 #!/bin/bash
 
 # ---------------------------
-# Frigate Helper Script v6.0 (öffentlich, bereinigt)
-# Automatisierte Installation auf Proxmox LXC
+# Frigate Helper Script v7.0 (öffentlich, Template-Download automatisch)
 # ---------------------------
 
 STORAGE="local-lvm"
@@ -53,19 +52,20 @@ if [ -d "$FRIGATE_DIR" ]; then
     rm -rf "$FRIGATE_DIR"
 fi
 
-# Repo klonen (öffentlich, nur einmal)
+# Repo klonen (öffentlich)
 echo "Klonen des öffentlichen Repos..."
 git clone https://github.com/sebrosch/$GITHUB_REPO.git "$FRIGATE_DIR" --branch main
 chmod +x "$FRIGATE_DIR/frigate-helper"
 
-# LXC Template prüfen
+# LXC Template prüfen und ggf. automatisch laden
 TEMPLATE_PATH="/var/lib/vz/template/cache/$TEMPLATE"
 if [ ! -f "$TEMPLATE_PATH" ]; then
-    echo "Fehler: LXC Template '$TEMPLATE' nicht gefunden auf Storage '$STORAGE'."
-    echo "Bitte herunterladen mit:"
-    echo "pveam update"
-    echo "pveam download $STORAGE $TEMPLATE"
-    exit 1
+    echo "LXC Template '$TEMPLATE' nicht gefunden auf Storage '$STORAGE'. Lade es automatisch herunter..."
+    pveam update
+    if ! pveam download $STORAGE $TEMPLATE; then
+        echo "Fehler: Template-Download fehlgeschlagen. Bitte überprüfe Storage '$STORAGE' und Internetverbindung."
+        exit 1
+    fi
 fi
 
 # CTID ermitteln
