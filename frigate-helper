@@ -1,25 +1,34 @@
 #!/bin/bash
 set -e
 
-echo "=== Frigate LXC Helper ==="
-
-# 1️⃣ Eingaben abfragen
-read -p "Container-ID (CTID) eingeben: " CTID
-echo
-echo "Verfügbare Debian Templates:"
-ls /var/lib/vz/template/cache/debian-*.tar.zst
-read -p "Template auswählen: " TEMPLATE
-read -p "Storage auswählen (z.B. local, data): " STORAGE
-
-echo
-read -p "Netzwerktyp eingeben (dhcp/statisch): " NET_TYPE
-if [ "$NET_TYPE" == "statisch" ]; then
-    read -p "IP-Adresse eingeben (z.B. 192.168.1.100/24): " STATIC_IP
-    read -p "Gateway eingeben (z.B. 192.168.1.1): " GATEWAY
+# Prüfen ob whiptail installiert ist
+if ! command -v whiptail &>/dev/null; then
+    echo "whiptail wird benötigt. Installiere..."
+    apt update && apt install -y whiptail
 fi
 
-# 2️⃣ Container erstellen
-echo "=== Erstelle LXC Container $CTID mit Template $TEMPLATE auf Storage $STORAGE ==="
+# 1️⃣ Container-ID abfragen
+CTID=$(whiptail --inputbox "Container-ID (CTID) eingeben:" 8 40 112 --title "Frigate LXC Helper" 3>&1 1>&2 2>&3)
+
+# 2️⃣ Debian Templates anzeigen
+TEMPLATES=($(ls /var/lib/vz/template/cache/debian-*.tar.zst))
+TEMPLATE=$(whiptail --menu "Wähle Debian Template:" 15 60 4 $(for t in "${TEMPLATES[@]}"; do echo "$t $t"; done) --title "Frigate LXC Helper" 3>&1 1>&2 2>&3)
+
+# 3️⃣ Storage auswählen
+STORAGES=($(pct storage list | awk '{print $1}'))
+STORAGE=$(whiptail --menu "Wähle Storage:" 15 60 4 $(for s in "${STORAGES[@]}"; do echo "$s $s"; done) --title "Frigate LXC Helper" 3>&1 1>&2 2>&3)
+
+# 4️⃣ Netzwerktyp auswählen
+NET_TYPE=$(whiptail --radiolist "Netzwerktyp:" 15 60 2 \
+"dhcp" "DHCP (automatische IP)" ON \
+"statisch" "Statische IP" OFF --title "Frigate LXC Helper" 3>&1 1>&2 2>&3)
+
+if [ "$NET_TYPE" == "statisch" ]; then
+    STATIC_IP=$(whiptail --inputbox "IP-Adresse (z.B. 192.168.1.100/24) eingeben:" 8 40 --title "Frigate LXC Helper" 3>&1 1>&2 2>&3)
+    GATEWAY=$(whiptail --inputbox "Gateway (z.B. 192.168.1.1) eingeben:" 8 40 --title "Frigate LXC Helper" 3>&1 1>&2 2>&3)
+fi
+
+# 5️⃣ Container erstellen
 if [ "$NET_TYPE" == "dhcp" ]; then
     pct create $CTID /var/lib/vz/template/cache/$TEMPLATE -storage $STORAGE -net0 name=eth0,bridge=vmbr0
 else
@@ -27,28 +36,22 @@ else
 fi
 
 pct start $CTID
-echo "Container gestartet. Warte 5 Sekunden..."
 sleep 5
 
-# 3️⃣ Netzwerkprüfung
-echo "=== Prüfe Netzwerk im Container ==="
+# 6️⃣ Netzwerk prüfen
 if ! pct exec $CTID -- ping -c 1 8.8.8.8 &>/dev/null; then
-    echo "Keine Netzwerkverbindung erkannt. Bitte Netzwerkkonfiguration überprüfen."
+    whiptail --msgbox "Keine Netzwerkverbindung erkannt. Bitte Netzwerkkonfiguration prüfen." 8 40
     exit 1
 fi
 
-if ! pct exec $CTID -- ping -c 1 deb.debian.org &>/dev/null; then
-    echo "DNS Problem erkannt – setze Google DNS automatisch"
-    pct exec $CTID -- bash -c 'echo "nameserver 8.8.8.8" > /etc/resolv.conf'
-fi
-
-# 4️⃣ Docker Installation
-echo "=== Installiere Docker im Container ==="
+# 7️⃣ Docker installieren
 pct exec $CTID -- bash -c "apt update && apt install -y curl gnupg lsb-release"
 pct exec $CTID -- bash -c "curl -fsSL https://get.docker.com | sh"
 
-# 5️⃣ Optional Frigate starten
-echo
-read -p "Frigate im Container direkt starten? (j/n): " START_FRIGATE
-if [ "$START_FRIGATE" == "j" ]; then
-    pct exec $CTID -- bash -c "docker run -d --name frigate -p 5000:5000 blakeblackshear/frigate:st
+# 8️⃣ Frigate starten
+if whiptail --yesno "Frigate direkt im Container starten?" 8 40; then
+    pct exec $CTID -- bash -c "docker run -d --name frigate -p 5000:5000 blakeblackshear/frigate:stable"
+    whiptail --msgbox "Frigate läuft jetzt unter http://<IP>:5000" 8 40
+fi
+
+whiptail --msgbox "=== Fertig! Container $CTID ist bereit ===" 8 40
