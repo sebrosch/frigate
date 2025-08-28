@@ -1,58 +1,68 @@
 #!/bin/bash
-set -e
 
-echo "=== Geführte Frigate Installation auf Proxmox LXC ==="
-
-# 1️⃣ LXC-Parameter abfragen
-read -p "ID des neuen Containers (z.B. 112): " CTID
-read -p "Name des Containers: " CTNAME
-read -p "Speicherplatz in GB (z.B. 8): " CTDISK
-read -p "RAM in MB (z.B. 2048): " CTRAM
-read -p "CPU cores (z.B. 2): " CTCPU
-read -p "Netzwerk-Bridge (z.B. vmbr0): " CTBRIDGE
-read -p "IP-Adresse des Containers (z.B. 192.168.1.100/24): " CTIP
-
-# 2️⃣ Prüfen, ob Template vorhanden ist
-TEMPLATE="/var/lib/vz/template/cache/debian-12-standard_12.7-1_amd64.tar.zst"
-if [ ! -f "$TEMPLATE" ]; then
-    echo "Template nicht gefunden. Lade herunter..."
-    wget -O "$TEMPLATE" "https://downloads.proxmox.com/vztmpl/debian-12-standard_12.7-1_amd64.tar.zst"
+# Prüfen, ob whiptail installiert ist
+if ! command -v whiptail &> /dev/null; then
+    echo "whiptail wird benötigt. Installiere es..."
+    apt update && apt install -y whiptail
 fi
 
-# 3️⃣ LXC erstellen
-echo "Erstelle Container $CTID..."
-pct create $CTID local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst \
-  -hostname $CTNAME \
-  -cores $CTCPU \
-  -memory $CTRAM \
-  -net0 name=eth0,bridge=$CTBRIDGE,ip=$CTIP \
-  -rootfs local-lvm:$CTDISK \
-  -features nesting=1
+# Schritt 1: Debian-Template automatisch finden
+TEMPLATES=($(ls /var/lib/vz/template/cache/debian-*-standard_*.tar.zst 2>/dev/null))
+if [ ${#TEMPLATES[@]} -eq 0 ]; then
+    echo "Kein Debian-Template gefunden. Bitte zuerst ein Template in /var/lib/vz/template/cache/ ablegen."
+    exit 1
+fi
 
+# Template-Auswahl
+TEMPLATE=$(whiptail --title "Debian Template auswählen" --menu "Wähle ein Template für den Container:" 15 60 4 \
+$(for t in "${TEMPLATES[@]}"; do echo "$t $(basename $t)"; done) \
+3>&1 1>&2 2>&3)
+
+# Schritt 2: Storage auswählen
+STORAGES=($(pvesm status | awk 'NR>1 {print $1}'))
+STORAGE=$(whiptail --title "Storage auswählen" --menu "Wähle einen Storage für den Container:" 15 60 4 \
+$(for s in "${STORAGES[@]}"; do echo "$s $s"; done) \
+3>&1 1>&2 2>&3)
+
+# Schritt 3: CTID festlegen
+CTID=$(whiptail --title "Container ID" --inputbox "Gib die CTID für den neuen Container ein:" 8 40 "112" 3>&1 1>&2 2>&3)
+
+# Schritt 4: IP-Modus auswählen
+IP_MODE=$(whiptail --title "Netzwerk Modus" --menu "Wähle IP-Konfiguration:" 15 60 4 \
+"dhcp" "DHCP" \
+"static" "Feste IP" \
+3>&1 1>&2 2>&3)
+
+if [ "$IP_MODE" == "static" ]; then
+    IP=$(whiptail --title "Feste IP" --inputbox "Gib die feste IP-Adresse für den Container ein:" 8 40 "192.168.1.100/24" 3>&1 1>&2 2>&3)
+    GATEWAY=$(whiptail --title "Gateway" --inputbox "Gib das Gateway ein:" 8 40 "192.168.1.1" 3>&1 1>&2 2>&3)
+fi
+
+# Schritt 5: Container erstellen
+echo "Erstelle LXC Container..."
+if [ "$IP_MODE" == "dhcp" ]; then
+    pct create $CTID $TEMPLATE --storage $STORAGE --net0 name=eth0,bridge=vmbr0,ip=dhcp --ostype debian --hostname frigate-$CTID --features nesting=1
+else
+    pct create $CTID $TEMPLATE --storage $STORAGE --net0 name=eth0,bridge=vmbr0,ip=$IP,gw=$GATEWAY --ostype debian --hostname frigate-$CTID --features nesting=1
+fi
+
+# Schritt 6: Container starten
 pct start $CTID
-echo "Container gestartet."
 
-# 4️⃣ Pakete im Container installieren
-echo "Installiere Docker und Abhängigkeiten im Container..."
-pct exec $CTID -- bash -c "
-apt update &&
-apt install -y git jq lsb-release curl docker.io docker-compose
-"
+# Schritt 7: Netzwerk testen und DNS fixen
+echo "Überprüfe Netzwerk im Container..."
+pct exec $CTID -- bash -c "ping -c 1 8.8.8.8 >/dev/null 2>&1 || (echo 'Netzwerk fehlerhaft!'; exit 1)"
+pct exec $CTID -- bash -c "echo 'nameserver 1.1.1.1' > /etc/resolv.conf"
 
-# 5️⃣ Frigate klonen
-echo "Klonen von Frigate..."
-pct exec $CTID -- bash -c "
-rm -rf /opt/frigate &&
-git clone https://github.com/sebrosch/frigate.git /opt/frigate --branch main &&
-chmod +x /opt/frigate/frigate-helper
-"
+# Schritt 8: Docker installieren
+echo "Installiere Docker im Container..."
+pct exec $CTID -- bash -c "apt update && apt install -y curl gnupg lsb-release"
+pct exec $CTID -- bash -c "curl -fsSL https://get.docker.com -o get-docker.sh"
+pct exec $CTID -- bash -c "sh get-docker.sh"
 
-# 6️⃣ Frigate starten
-echo "Starte Frigate im Container..."
-pct exec $CTID -- bash -c "
-cd /opt/frigate &&
-docker-compose up -d
-"
+# Schritt 9: Frigate starten
+echo "Frigate im Container einrichten..."
+pct exec $CTID -- bash -c "docker run -d --name frigate --restart=unless-stopped -p 5000:5000 blakeblackshear/frigate:stable-amd64"
 
-echo "✅ Frigate läuft im Container $CTID"
-echo "Zugriff auf die WebUI: http://${CTIP%/*}:5000"
+echo "Frigate läuft jetzt im Container $CTID."
+echo "Zugriff: http://<IP>:5000"
