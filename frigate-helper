@@ -1,64 +1,77 @@
 #!/bin/bash
+# Vollautomatischer Frigate LXC Installer für Proxmox (inkl. Docker-Compose Start)
+
 set -e
 
-# Prüfen, ob whiptail installiert ist
-if ! command -v whiptail &> /dev/null; then
-    apt update && apt install -y whiptail
-fi
+echo "=== Vollautomatischer Frigate LXC Installer ==="
 
-# Template-Auswahl
-TEMPLATE=$(whiptail --title "Frigate Installation" --menu "Wähle ein Debian Template:" 15 60 4 \
-"debian-12-standard_12.7-1_amd64.tar.zst" "" \
-"debian-12-standard_12.11-1_amd64.tar.zst" "" 3>&1 1>&2 2>&3)
-
-# Storage Auswahl aus Proxmox Storage.cfg
-STORAGE_LIST=$(grep 'type' /etc/pve/storage.cfg | awk '{print $1}')
-STORAGE=$(whiptail --title "Storage Auswahl" --menu "Wähle einen Storage für den Container:" 15 60 4 \
-$(for s in $STORAGE_LIST; do echo "$s"; done) 3>&1 1>&2 2>&3)
-
-# VMID Auswahl
-VMID=$(whiptail --inputbox "Gib die VMID für den Container ein:" 8 40 112 3>&1 1>&2 2>&3)
-
-# Netzwerk
-NET_TYPE=$(whiptail --title "Netzwerk" --menu "DHCP oder feste IP?" 10 40 2 \
-"dhcp" "DHCP" \
-"static" "Feste IP" 3>&1 1>&2 2>&3)
-
-if [ "$NET_TYPE" == "static" ]; then
-    IP_ADDR=$(whiptail --inputbox "Gib die feste IP-Adresse ein (z.B. 192.168.1.100/24):" 8 40 192.168.1.100 3>&1 1>&2 2>&3)
-    GATEWAY=$(whiptail --inputbox "Gib das Gateway ein (z.B. 192.168.1.1):" 8 40 192.168.1.1 3>&1 1>&2 2>&3)
-fi
-
-# Container erstellen
-echo "Erstelle LXC Container $VMID auf Storage $STORAGE..."
-if [ "$NET_TYPE" == "dhcp" ]; then
-    pct create $VMID /var/lib/vz/template/cache/$TEMPLATE -storage $STORAGE -net0 name=eth0,bridge=vmbr0,ip=dhcp
+# 1. Netzwerk prüfen
+echo "Prüfe Internetzugang..."
+if ping -c 2 8.8.8.8 &> /dev/null; then
+    echo "Internetverbindung OK"
 else
-    pct create $VMID /var/lib/vz/template/cache/$TEMPLATE -storage $STORAGE -net0 name=eth0,bridge=vmbr0,ip=$IP_ADDR,gw=$GATEWAY
+    echo "Keine Internetverbindung! Bitte prüfen."
+    exit 1
 fi
 
-# Container starten
-pct start $VMID
+# 2. LXC Template auswählen / herunterladen
+echo
+echo "=== LXC Template ==="
+TEMPLATE="debian-12-standard_12.7-1_amd64.tar.zst"
+TEMPLATE_PATH="/var/lib/vz/template/cache/$TEMPLATE"
 
-# Docker Installation im Container
-echo "Installiere Docker im Container $VMID..."
-pct exec $VMID -- bash -c "apt update && apt install -y curl gnupg lsb-release && curl -fsSL https://get.docker.com | sh"
-
-# Frigate Docker Container starten
-echo "Starte Frigate im Container $VMID..."
-pct exec $VMID -- bash -c "docker pull blakeblackshear/frigate:stable && \
-docker run -d --name frigate --restart=unless-stopped \
---privileged \
---device /dev/bus/usb:/dev/bus/usb \
--p 5000:5000 \
--v /mnt/frigate/config:/config \
--v /mnt/frigate/clips:/clips \
--v /mnt/frigate/recordings:/recordings \
-blakeblackshear/frigate:stable"
-
-echo "Frigate Container $VMID ist fertig!"
-if [ "$NET_TYPE" == "dhcp" ]; then
-    echo "Zugriff: http://<Container_IP>:5000 (IP per DHCP vom Proxmox)"
+if [ ! -f "$TEMPLATE_PATH" ]; then
+    echo "Template nicht gefunden. Lade herunter..."
+    pveam update
+    pveam download local "$TEMPLATE"
 else
-    echo "Zugriff: http://$IP_ADDR:5000"
+    echo "Template bereits vorhanden: $TEMPLATE_PATH"
 fi
+
+# 3. Container-Parameter abfragen
+echo
+read -p "Bitte Container-ID (z.B. 112) eingeben: " CTID
+read -p "Hostname für Container: " HOSTNAME
+read -p "RAM in MB (z.B. 4096): " RAM
+read -p "CPU-Kerne (z.B. 2): " CORES
+read -p "Rootfs Größe in GB (z.B. 8): " ROOTFS
+read -p "Bridge Interface (z.B. vmbr0): " BRIDGE
+
+# 4. Container erstellen
+echo
+echo "Erstelle Container $CTID..."
+pct create $CTID "$TEMPLATE_PATH" \
+    --hostname "$HOSTNAME" \
+    --memory "$RAM" \
+    --swap 512 \
+    --cores "$CORES" \
+    --net0 name=eth0,bridge="$BRIDGE",ip=dhcp \
+    --rootfs local-lvm:"$ROOTFS" \
+    --features nesting=1
+
+# 5. Container starten
+pct start $CTID
+
+# 6. Docker + Frigate Installation im Container automatisch
+echo
+echo "Installiere Docker & Frigate im Container..."
+pct exec $CTID -- bash -c "
+    set -e
+    apt update && apt upgrade -y
+    apt install -y sudo curl lsb-release gnupg git
+    curl -fsSL https://get.docker.com | sh
+    systemctl enable docker
+    systemctl start docker
+    apt install -y docker-compose
+    git clone https://github.com/blakeblackshear/frigate.git /opt/frigate
+    cd /opt/frigate
+    docker-compose up -d
+"
+
+# 7. Fertigmeldung
+echo
+echo "=== Fertig! ==="
+echo "Container $CTID läuft mit Frigate."
+echo "Frigate WebUI erreichbar auf der IP des Containers Port 5000."
+echo "Beispiel: http://<CONTAINER_IP>:5000"
+echo "Direkter Login in den Container: pct console $CTID"
