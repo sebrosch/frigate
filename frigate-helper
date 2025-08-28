@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ---------------------------
-# Frigate Helper Script v5.0 (öffentlich)
-# Automatisierte Installation auf Proxmox LXC mit Template-Check
+# Frigate Helper Script v6.0 (öffentlich, bereinigt)
+# Automatisierte Installation auf Proxmox LXC
 # ---------------------------
 
 STORAGE="local-lvm"
@@ -53,7 +53,7 @@ if [ -d "$FRIGATE_DIR" ]; then
     rm -rf "$FRIGATE_DIR"
 fi
 
-# Repo klonen (öffentlich, ohne PAT)
+# Repo klonen (öffentlich, nur einmal)
 echo "Klonen des öffentlichen Repos..."
 git clone https://github.com/sebrosch/$GITHUB_REPO.git "$FRIGATE_DIR" --branch main
 chmod +x "$FRIGATE_DIR/frigate-helper"
