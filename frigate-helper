@@ -44,9 +44,9 @@ ROOT_PASS=$(whiptail --title "Root Passwort" --passwordbox "Gib ein Root-Passwor
 # Schritt 6: Container erstellen
 echo "Erstelle LXC Container..."
 if [ "$IP_MODE" == "dhcp" ]; then
-    NET_CONFIG="name=eth0,bridge=vmbr0,ip=dhcp,tag=10"
+    NET_CONFIG="name=eth0,bridge=vmbr0,ip=dhcp"
 else
-    NET_CONFIG="name=eth0,bridge=vmbr0,ip=$IP,gw=$GATEWAY,tag=10"
+    NET_CONFIG="name=eth0,bridge=vmbr0,ip=$IP,gw=$GATEWAY"
 fi
 
 pct create $CTID $TEMPLATE --storage $STORAGE --net0 $NET_CONFIG --ostype debian --hostname frigate-$CTID --features nesting=1 --password "$ROOT_PASS"
