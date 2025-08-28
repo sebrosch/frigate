@@ -1,81 +1,107 @@
 #!/bin/bash
-set -e
 
-# 1️⃣ Templates finden
-TEMPLATES=($(ls /var/lib/vz/template/cache/debian-*-standard_*.tar.zst 2>/dev/null))
-if [ ${#TEMPLATES[@]} -eq 0 ]; then
-    echo "Keine Debian-Templates gefunden unter /var/lib/vz/template/cache/"
-    exit 1
+# Notwendige Pakete installieren
+apt update
+apt install -y git jq dialog
+
+# Frigate klonen
+rm -rf /opt/frigate
+git clone https://github.com/sebrosch/frigate.git /opt/frigate --branch main
+chmod +x /opt/frigate/frigate-helper
+
+# Debian-Templates automatisch erkennen
+templates=($(ls /var/lib/vz/template/cache/debian-*-standard_*.tar.zst 2>/dev/null))
+if [ ${#templates[@]} -eq 0 ]; then
+  echo "Kein Debian Template gefunden in /var/lib/vz/template/cache/"
+  exit 1
 fi
 
-echo "Gefundene Debian-Templates:"
-select TEMPLATE in "${TEMPLATES[@]}"; do
-    if [ -n "$TEMPLATE" ]; then
-        echo "Ausgewählt: $TEMPLATE"
-        break
-    fi
+# Nächsten freien CTID finden
+ctid=100
+while pct status $ctid &>/dev/null; do
+  ((ctid++))
 done
 
-# 2️⃣ Storage auswählen
-STORAGES=($(pvesm status | awk 'NR>1 {print $1}'))
-echo "Verfügbare Storage:"
-select STORAGE in "${STORAGES[@]}"; do
-    if [ -n "$STORAGE" ]; then
-        echo "Container wird auf Storage $STORAGE erstellt"
+# Hauptmenü für Container-Einstellungen
+HEIGHT=20
+WIDTH=70
+CHOICE_HEIGHT=15
+
+while true; do
+  OPTIONS=(
+    1 "Debian Template auswählen"
+    2 "Storage auswählen"
+    3 "Netzwerkmodus (DHCP oder feste IP)"
+    4 "CPU Kerne"
+    5 "RAM in MB"
+    6 "Diskgröße in GB"
+    7 "Start Installation"
+    8 "Abbrechen"
+  )
+  CHOICE=$(dialog --clear --title "Frigate Container Setup" \
+          --menu "CTID: $ctid" $HEIGHT $WIDTH $CHOICE_HEIGHT \
+          "${OPTIONS[@]}" 3>&1 1>&2 2>&3)
+  clear
+
+  case $CHOICE in
+    1)
+      template=$(dialog --menu "Wähle ein Debian Template:" 15 60 4 \
+                  $(for t in "${templates[@]}"; do echo "$t $t"; done) 3>&1 1>&2 2>&3)
+      clear
+      ;;
+    2)
+      storages=($(pvesm status | awk 'NR>1 {print $1}'))
+      storage=$(dialog --menu "Wähle den Storage für den Container:" 15 60 4 \
+                $(for s in "${storages[@]}"; do echo "$s $s"; done) 3>&1 1>&2 2>&3)
+      clear
+      ;;
+    3)
+      ip_choice=$(dialog --menu "Netzwerk-Einstellungen:" 10 50 2 \
+                  1 "DHCP" \
+                  2 "Feste IP" 3>&1 1>&2 2>&3)
+      clear
+      if [ "$ip_choice" -eq 2 ]; then
+        ip=$(dialog --inputbox "Gib die feste IP ein (z.B. 192.168.1.50/24):" 10 50 3>&1 1>&2 2>&3)
+        clear
+      else
+        ip=""
+      fi
+      ;;
+    4)
+      cpu=$(dialog --inputbox "Anzahl der CPU Kerne:" 10 50 2 3>&1 1>&2 2>&3)
+      clear
+      ;;
+    5)
+      ram=$(dialog --inputbox "RAM in MB:" 10 50 1024 3>&1 1>&2 2>&3)
+      clear
+      ;;
+    6)
+      disk=$(dialog --inputbox "Diskgröße in GB:" 10 50 10 3>&1 1>&2 2>&3)
+      clear
+      ;;
+    7)
+      # Prüfen, ob alle Parameter gesetzt sind
+      if [[ -z "$template" || -z "$storage" || -z "$cpu" || -z "$ram" || -z "$disk" ]]; then
+        dialog --msgbox "Bitte alle notwendigen Einstellungen vor der Installation auswählen!" 10 50
+        clear
+      else
         break
-    fi
+      fi
+      ;;
+    8)
+      echo "Abbruch durch Benutzer."
+      exit 1
+      ;;
+  esac
 done
 
-# 3️⃣ Container-ID abfragen
-read -p "CTID für den Container: " CTID
-
-# 4️⃣ DHCP oder statische IP
-echo "Netzwerkmodus wählen:"
-select NETMODE in "DHCP" "Static"; do
-    if [ "$NETMODE" == "DHCP" ]; then
-        IP_CONF=""
-        break
-    elif [ "$NETMODE" == "Static" ]; then
-        read -p "Statische IP (z.B. 192.168.1.100/24): " STATIC_IP
-        read -p "Gateway (z.B. 192.168.1.1): " GATEWAY
-        IP_CONF="--net0 name=eth0,bridge=vmbr0,ip=$STATIC_IP,gw=$GATEWAY"
-        break
-    fi
-done
-
-# 5️⃣ Container erstellen
-echo "Erstelle LXC Container $CTID..."
-pct create $CTID $TEMPLATE --storage $STORAGE $IP_CONF --hostname frigate-$CTID --password root
-
-# 6️⃣ Locale fixen
-pct exec $CTID -- bash -c "
-apt update && apt install -y locales
-locale-gen en_US.UTF-8
-update-locale LANG=en_US.UTF-8
-"
-
-# 7️⃣ Docker installieren
-pct exec $CTID -- bash -c "
-apt update && apt install -y ca-certificates curl gnupg
-mkdir -p /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable' > /etc/apt/sources.list.d/docker.list
-apt update
-apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-systemctl enable docker
-systemctl start docker
-"
-
-# 8️⃣ Frigate installieren
-pct exec $CTID -- bash -c "
-apt update && apt install -y git jq
-git clone https://github.com/blakeblackshear/frigate.git /opt/frigate
-cd /opt/frigate
-docker compose up -d
-"
-
-echo "-----------------------------------"
-echo "Frigate Container erstellt und gestartet!"
-echo "CTID: $CTID"
-echo "Zugriff: http://<Container-IP>:5000"
-echo "-----------------------------------"
+# Container erstellen mit Fortschrittsanzeige
+(
+dialog --title "Frigate Container" --infobox "Erstelle Container $ctid auf Storage $storage..." 10 50
+sleep 2
+/opt/frigate/frigate-helper create \
+  --template "$template" \
+  --storage "$storage" \
+  --ctid "$ctid" \
+  --cpu "$cpu" \
+  --ram "$ram
