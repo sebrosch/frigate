@@ -1,14 +1,18 @@
 #!/bin/bash
 
 # ---------------------------
-# Frigate Helper Script v1.0
-# Angepasst: Storage Option + Help
+# Frigate Helper Script v2.0
+# Features:
+# - Storage Option
+# - Help-Menü
+# - Prüft und lädt fehlendes LXC-Template
+# - Löscht ggf. alte Container und /opt/frigate
 # ---------------------------
 
-# Default Storage
 STORAGE="local-lvm"
+TEMPLATE="/var/lib/vz/template/cache/debian-12-standard_12.2-1_amd64.tar.gz"
+FRIGATE_DIR="/opt/frigate"
 
-# Help-Menü
 show_help() {
     echo "Usage: $0 create [--storage STORAGE_NAME]"
     echo ""
@@ -39,23 +43,46 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Prüfen ob Action gesetzt ist
 if [[ "$ACTION" != "create" ]]; then
     show_help
 fi
 
-# ---------------------------
-# CREATE-Teil (original übernommen)
-# ---------------------------
-
 echo "=== Starte Frigate Installation ==="
 echo "Verwende Storage: $STORAGE"
 
-# Beispiel: LXC erstellen (CTID automatisch ermitteln)
-NEXT_CID=$(pvesh get /cluster/nextid)
-echo "Erstelle Container mit CTID: $NEXT_CID"
+# Prüfen, ob /opt/frigate existiert
+if [ -d "$FRIGATE_DIR" ]; then
+    echo "Altes /opt/frigate Verzeichnis gefunden, lösche es..."
+    rm -rf "$FRIGATE_DIR"
+fi
 
-pct create $NEXT_CID /var/lib/vz/template/cache/debian-12-standard_12.2-1_amd64.tar.gz \
+# Git-Klon erstellen
+echo "Klonen des Repos..."
+git clone git@github.com:sebrosch/frigate.git "$FRIGATE_DIR" --branch main
+
+chmod +x "$FRIGATE_DIR/frigate-helper"
+
+# Prüfen, ob LXC-Template existiert
+if [ ! -f "$TEMPLATE" ]; then
+    echo "LXC Template fehlt, lade es herunter..."
+    pveam update
+    pveam download local debian-12-standard_12.2-1_amd64.tar.gz
+fi
+
+# CTID ermitteln
+NEXT_CID=$(pvesh get /cluster/nextid)
+echo "CTID: $NEXT_CID"
+
+# Prüfen, ob Container existiert
+if pct status $NEXT_CID &>/dev/null; then
+    echo "Alter Container mit CTID $NEXT_CID gefunden, lösche ihn..."
+    pct stop $NEXT_CID
+    pct destroy $NEXT_CID
+fi
+
+# LXC erstellen
+echo "Erstelle Container..."
+pct create $NEXT_CID "$TEMPLATE" \
     --storage $STORAGE \
     --hostname frigate \
     --cores 2 \
@@ -66,30 +93,22 @@ pct create $NEXT_CID /var/lib/vz/template/cache/debian-12-standard_12.2-1_amd64.
     --ostype debian \
     --password 'changeme'
 
-echo "Starte Container..."
 pct start $NEXT_CID
 
-# Docker installieren und Frigate vorbereiten
+# Docker installieren
 echo "Installiere Docker im Container..."
-pct exec $NEXT_CID -- bash -c "apt update && apt install -y docker.io docker-compose"
+pct exec $NEXT_CID -- bash -c "apt update && apt install -y docker.io docker-compose git"
 
-# Verzeichnisse für Frigate anlegen
+# Verzeichnisse für Frigate
 pct exec $NEXT_CID -- mkdir -p /opt/frigate/config /opt/frigate/media
-
-# Config von GitHub laden
-pct exec $NEXT_CID -- bash -c "git clone https://github.com/sebrosch/frigate.git /opt/frigate --branch main"
-
-# Frigate Helper im Container ausführbar machen
-pct exec $NEXT_CID -- chmod +x /opt/frigate/frigate-helper
 
 # Frigate starten
 pct exec $NEXT_CID -- /opt/frigate/frigate-helper start
 
-# Container IP anzeigen
+# Container-IP ausgeben
 IP=$(pct exec $NEXT_CID -- hostname -I | awk '{print $1}')
 echo "-----------------------------------"
 echo "Frigate läuft im Container!"
 echo "Zugriff: http://$IP:5000"
 echo "CTID: $NEXT_CID"
 echo "-----------------------------------"
-
