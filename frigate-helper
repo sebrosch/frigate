@@ -1,57 +1,64 @@
 #!/bin/bash
 set -e
 
-# Prüfen ob whiptail installiert ist
-if ! command -v whiptail &>/dev/null; then
-    echo "whiptail wird benötigt. Installiere..."
+# Prüfen, ob whiptail installiert ist
+if ! command -v whiptail &> /dev/null; then
     apt update && apt install -y whiptail
 fi
 
-# 1️⃣ Container-ID abfragen
-CTID=$(whiptail --inputbox "Container-ID (CTID) eingeben:" 8 40 112 --title "Frigate LXC Helper" 3>&1 1>&2 2>&3)
+# Template-Auswahl
+TEMPLATE=$(whiptail --title "Frigate Installation" --menu "Wähle ein Debian Template:" 15 60 4 \
+"debian-12-standard_12.7-1_amd64.tar.zst" "" \
+"debian-12-standard_12.11-1_amd64.tar.zst" "" 3>&1 1>&2 2>&3)
 
-# 2️⃣ Debian Templates anzeigen
-TEMPLATES=($(ls /var/lib/vz/template/cache/debian-*.tar.zst))
-TEMPLATE=$(whiptail --menu "Wähle Debian Template:" 15 60 4 $(for t in "${TEMPLATES[@]}"; do echo "$t $t"; done) --title "Frigate LXC Helper" 3>&1 1>&2 2>&3)
+# Storage Auswahl aus Proxmox Storage.cfg
+STORAGE_LIST=$(grep 'type' /etc/pve/storage.cfg | awk '{print $1}')
+STORAGE=$(whiptail --title "Storage Auswahl" --menu "Wähle einen Storage für den Container:" 15 60 4 \
+$(for s in $STORAGE_LIST; do echo "$s"; done) 3>&1 1>&2 2>&3)
 
-# 3️⃣ Storage auswählen
-STORAGES=($(pct storage list | awk '{print $1}'))
-STORAGE=$(whiptail --menu "Wähle Storage:" 15 60 4 $(for s in "${STORAGES[@]}"; do echo "$s $s"; done) --title "Frigate LXC Helper" 3>&1 1>&2 2>&3)
+# VMID Auswahl
+VMID=$(whiptail --inputbox "Gib die VMID für den Container ein:" 8 40 112 3>&1 1>&2 2>&3)
 
-# 4️⃣ Netzwerktyp auswählen
-NET_TYPE=$(whiptail --radiolist "Netzwerktyp:" 15 60 2 \
-"dhcp" "DHCP (automatische IP)" ON \
-"statisch" "Statische IP" OFF --title "Frigate LXC Helper" 3>&1 1>&2 2>&3)
+# Netzwerk
+NET_TYPE=$(whiptail --title "Netzwerk" --menu "DHCP oder feste IP?" 10 40 2 \
+"dhcp" "DHCP" \
+"static" "Feste IP" 3>&1 1>&2 2>&3)
 
-if [ "$NET_TYPE" == "statisch" ]; then
-    STATIC_IP=$(whiptail --inputbox "IP-Adresse (z.B. 192.168.1.100/24) eingeben:" 8 40 --title "Frigate LXC Helper" 3>&1 1>&2 2>&3)
-    GATEWAY=$(whiptail --inputbox "Gateway (z.B. 192.168.1.1) eingeben:" 8 40 --title "Frigate LXC Helper" 3>&1 1>&2 2>&3)
+if [ "$NET_TYPE" == "static" ]; then
+    IP_ADDR=$(whiptail --inputbox "Gib die feste IP-Adresse ein (z.B. 192.168.1.100/24):" 8 40 192.168.1.100 3>&1 1>&2 2>&3)
+    GATEWAY=$(whiptail --inputbox "Gib das Gateway ein (z.B. 192.168.1.1):" 8 40 192.168.1.1 3>&1 1>&2 2>&3)
 fi
 
-# 5️⃣ Container erstellen
+# Container erstellen
+echo "Erstelle LXC Container $VMID auf Storage $STORAGE..."
 if [ "$NET_TYPE" == "dhcp" ]; then
-    pct create $CTID /var/lib/vz/template/cache/$TEMPLATE -storage $STORAGE -net0 name=eth0,bridge=vmbr0
+    pct create $VMID /var/lib/vz/template/cache/$TEMPLATE -storage $STORAGE -net0 name=eth0,bridge=vmbr0,ip=dhcp
 else
-    pct create $CTID /var/lib/vz/template/cache/$TEMPLATE -storage $STORAGE -net0 name=eth0,bridge=vmbr0,ip=$STATIC_IP,gw=$GATEWAY
+    pct create $VMID /var/lib/vz/template/cache/$TEMPLATE -storage $STORAGE -net0 name=eth0,bridge=vmbr0,ip=$IP_ADDR,gw=$GATEWAY
 fi
 
-pct start $CTID
-sleep 5
+# Container starten
+pct start $VMID
 
-# 6️⃣ Netzwerk prüfen
-if ! pct exec $CTID -- ping -c 1 8.8.8.8 &>/dev/null; then
-    whiptail --msgbox "Keine Netzwerkverbindung erkannt. Bitte Netzwerkkonfiguration prüfen." 8 40
-    exit 1
+# Docker Installation im Container
+echo "Installiere Docker im Container $VMID..."
+pct exec $VMID -- bash -c "apt update && apt install -y curl gnupg lsb-release && curl -fsSL https://get.docker.com | sh"
+
+# Frigate Docker Container starten
+echo "Starte Frigate im Container $VMID..."
+pct exec $VMID -- bash -c "docker pull blakeblackshear/frigate:stable && \
+docker run -d --name frigate --restart=unless-stopped \
+--privileged \
+--device /dev/bus/usb:/dev/bus/usb \
+-p 5000:5000 \
+-v /mnt/frigate/config:/config \
+-v /mnt/frigate/clips:/clips \
+-v /mnt/frigate/recordings:/recordings \
+blakeblackshear/frigate:stable"
+
+echo "Frigate Container $VMID ist fertig!"
+if [ "$NET_TYPE" == "dhcp" ]; then
+    echo "Zugriff: http://<Container_IP>:5000 (IP per DHCP vom Proxmox)"
+else
+    echo "Zugriff: http://$IP_ADDR:5000"
 fi
-
-# 7️⃣ Docker installieren
-pct exec $CTID -- bash -c "apt update && apt install -y curl gnupg lsb-release"
-pct exec $CTID -- bash -c "curl -fsSL https://get.docker.com | sh"
-
-# 8️⃣ Frigate starten
-if whiptail --yesno "Frigate direkt im Container starten?" 8 40; then
-    pct exec $CTID -- bash -c "docker run -d --name frigate -p 5000:5000 blakeblackshear/frigate:stable"
-    whiptail --msgbox "Frigate läuft jetzt unter http://<IP>:5000" 8 40
-fi
-
-whiptail --msgbox "=== Fertig! Container $CTID ist bereit ===" 8 40
