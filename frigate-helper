@@ -27,7 +27,7 @@ $(for s in "${STORAGES[@]}"; do echo "$s $s"; done) \
 # Schritt 3: CTID festlegen
 CTID=$(whiptail --title "Container ID" --inputbox "Gib die CTID für den neuen Container ein:" 8 40 "112" 3>&1 1>&2 2>&3)
 
-# Schritt 4: Netzwerkmodus auswählen
+# Schritt 4: IP-Modus auswählen
 IP_MODE=$(whiptail --title "Netzwerk Modus" --menu "Wähle IP-Konfiguration:" 15 60 4 \
 "dhcp" "DHCP" \
 "static" "Feste IP" \
@@ -38,34 +38,36 @@ if [ "$IP_MODE" == "static" ]; then
     GATEWAY=$(whiptail --title "Gateway" --inputbox "Gib das Gateway ein:" 8 40 "192.168.1.1" 3>&1 1>&2 2>&3)
 fi
 
-# Schritt 5: Root-Passwort abfragen
-PASSWORD=$(whiptail --title "Root Passwort" --passwordbox "Gib ein Passwort für den Container-Root ein:" 8 40 3>&1 1>&2 2>&3)
+# Schritt 5: SSH-Passwort für Container abfragen
+SSH_PASSWORD=$(whiptail --title "SSH Passwort" --passwordbox "Gib ein SSH Passwort für den Container ein:" 8 40 3>&1 1>&2 2>&3)
 
-# Schritt 6: Container erstellen
+# Schritt 6: LXC Container erstellen
 echo "Erstelle LXC Container..."
 if [ "$IP_MODE" == "dhcp" ]; then
-    pct create $CTID $TEMPLATE --storage $STORAGE --net0 name=eth0,bridge=vmbr0,ip=dhcp --ostype debian --hostname frigate-$CTID --features nesting=1 --password "$PASSWORD"
+    pct create $CTID $TEMPLATE --storage $STORAGE --net0 name=eth0,bridge=vmbr0,ip=dhcp --ostype debian --hostname frigate-$CTID --features nesting=1 --password "$SSH_PASSWORD"
 else
-    pct create $CTID $TEMPLATE --storage $STORAGE --net0 name=eth0,bridge=vmbr0,ip=$IP,gw=$GATEWAY --ostype debian --hostname frigate-$CTID --features nesting=1 --password "$PASSWORD"
+    pct create $CTID $TEMPLATE --storage $STORAGE --net0 name=eth0,bridge=vmbr0,ip=$IP,gw=$GATEWAY --ostype debian --hostname frigate-$CTID --features nesting=1 --password "$SSH_PASSWORD"
 fi
 
 # Schritt 7: Container starten
 pct start $CTID
 
-# Schritt 8: Docker installieren
-echo "Installiere Docker im Container..."
-pct exec $CTID -- bash -c "apt update && apt install -y curl gnupg lsb-release locales && locale-gen en_US.UTF-8 && curl -fsSL https://get.docker.com | sh"
+# Schritt 8: Locale im Container setzen (verhindert Warnungen)
+pct exec $CTID -- bash -c "apt update && apt install -y locales && locale-gen en_US.UTF-8 && update-locale LANG=en_US.UTF-8"
 
 # Schritt 9: Frigate auf Host klonen
 echo "Klonen Frigate-Repository auf Host..."
+mkdir -p /opt
 rm -rf /opt/frigate
 git clone https://github.com/sebrosch/frigate.git /opt/frigate --branch main
 
-# Schritt 10: Frigate ins Container kopieren
-echo "Kopiere Frigate in den Container..."
-pct push $CTID /opt/frigate /opt/frigate
+# Schritt 10: Frigate in Container kopieren
+pct push /opt/frigate $CTID:/opt/frigate --recursive
 
-# Schritt 11: Frigate starten via Docker-Compose
+# Schritt 11: Docker und Frigate im Container installieren
+echo "Installiere Docker im Container..."
+pct exec $CTID -- bash -c "apt update && apt install -y curl gnupg lsb-release && curl -fsSL https://get.docker.com | sh"
+
 echo "Starte Frigate im Container..."
 pct exec $CTID -- bash -c "cd /opt/frigate && docker-compose up -d"
 
