@@ -1,45 +1,49 @@
 #!/bin/bash
-# Vollautomatischer Frigate LXC Installer für Proxmox (inkl. Docker-Compose Start)
+# Geführter Frigate LXC Installer für Proxmox mit grafischer Shell + WebUI Link
 
 set -e
 
-echo "=== Vollautomatischer Frigate LXC Installer ==="
+# Prüfen, ob whiptail installiert ist
+if ! command -v whiptail &> /dev/null; then
+    apt update && apt install -y whiptail
+fi
 
-# 1. Netzwerk prüfen
-echo "Prüfe Internetzugang..."
-if ping -c 2 8.8.8.8 &> /dev/null; then
-    echo "Internetverbindung OK"
-else
-    echo "Keine Internetverbindung! Bitte prüfen."
+# Internetcheck
+if ! ping -c 2 8.8.8.8 &> /dev/null; then
+    whiptail --msgbox "Keine Internetverbindung erkannt! Bitte prüfen." 10 50
     exit 1
 fi
 
-# 2. LXC Template auswählen / herunterladen
-echo
-echo "=== LXC Template ==="
+# Schritt 1: Container-ID abfragen
+CTID=$(whiptail --inputbox "Gib die Container-ID ein (z.B. 112):" 10 50 112 --title "Container-ID" 3>&1 1>&2 2>&3)
+
+# Schritt 2: Hostname
+HOSTNAME=$(whiptail --inputbox "Hostname für den Container:" 10 50 "frigate" --title "Hostname" 3>&1 1>&2 2>&3)
+
+# Schritt 3: RAM
+RAM=$(whiptail --inputbox "RAM in MB (z.B. 4096):" 10 50 4096 --title "RAM" 3>&1 1>&2 2>&3)
+
+# Schritt 4: CPU-Kerne
+CORES=$(whiptail --inputbox "Anzahl CPU-Kerne:" 10 50 2 --title "CPU" 3>&1 1>&2 2>&3)
+
+# Schritt 5: Rootfs Größe
+ROOTFS=$(whiptail --inputbox "Rootfs Größe in GB:" 10 50 8 --title "Rootfs" 3>&1 1>&2 2>&3)
+
+# Schritt 6: Bridge Interface
+BRIDGE=$(whiptail --inputbox "Bridge Interface (z.B. vmbr0):" 10 50 "vmbr0" --title "Bridge" 3>&1 1>&2 2>&3)
+
+# Schritt 7: Template
 TEMPLATE="debian-12-standard_12.7-1_amd64.tar.zst"
 TEMPLATE_PATH="/var/lib/vz/template/cache/$TEMPLATE"
 
 if [ ! -f "$TEMPLATE_PATH" ]; then
-    echo "Template nicht gefunden. Lade herunter..."
+    whiptail --msgbox "Template nicht gefunden. Lade herunter..." 10 50
     pveam update
     pveam download local "$TEMPLATE"
-else
-    echo "Template bereits vorhanden: $TEMPLATE_PATH"
 fi
 
-# 3. Container-Parameter abfragen
-echo
-read -p "Bitte Container-ID (z.B. 112) eingeben: " CTID
-read -p "Hostname für Container: " HOSTNAME
-read -p "RAM in MB (z.B. 4096): " RAM
-read -p "CPU-Kerne (z.B. 2): " CORES
-read -p "Rootfs Größe in GB (z.B. 8): " ROOTFS
-read -p "Bridge Interface (z.B. vmbr0): " BRIDGE
-
-# 4. Container erstellen
-echo
-echo "Erstelle Container $CTID..."
+# Schritt 8: Container erstellen
+whiptail --msgbox "Erstelle Container $CTID..." 10 50
 pct create $CTID "$TEMPLATE_PATH" \
     --hostname "$HOSTNAME" \
     --memory "$RAM" \
@@ -49,12 +53,10 @@ pct create $CTID "$TEMPLATE_PATH" \
     --rootfs local-lvm:"$ROOTFS" \
     --features nesting=1
 
-# 5. Container starten
 pct start $CTID
 
-# 6. Docker + Frigate Installation im Container automatisch
-echo
-echo "Installiere Docker & Frigate im Container..."
+# Schritt 9: Docker & Frigate im Container installieren
+whiptail --msgbox "Installiere Docker & Frigate im Container..." 10 50
 pct exec $CTID -- bash -c "
     set -e
     apt update && apt upgrade -y
@@ -68,10 +70,8 @@ pct exec $CTID -- bash -c "
     docker-compose up -d
 "
 
-# 7. Fertigmeldung
-echo
-echo "=== Fertig! ==="
-echo "Container $CTID läuft mit Frigate."
-echo "Frigate WebUI erreichbar auf der IP des Containers Port 5000."
-echo "Beispiel: http://<CONTAINER_IP>:5000"
-echo "Direkter Login in den Container: pct console $CTID"
+# Schritt 10: Container-IP abfragen
+IP=$(pct exec $CTID -- hostname -I | awk '{print $1}')
+
+# Fertigmeldung
+whiptail --msgbox "Fertig! Container $CTID läuft mit Frigate.\nWebUI: http://$IP:5000" 10 60
