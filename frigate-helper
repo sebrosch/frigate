@@ -1,33 +1,42 @@
 #!/bin/bash
 
-# Prüfen ob whiptail installiert ist
+# ----------------------------
+# Frigate LXC Installation GUI
+# ----------------------------
+
+# Prüfen, ob whiptail installiert ist
 if ! command -v whiptail &> /dev/null; then
     echo "whiptail wird benötigt. Installiere es..."
     apt update && apt install -y whiptail
 fi
 
-# Schritt 1: Debian-Template automatisch finden
+# Schritt 1: Debian-Template auswählen
 TEMPLATES=($(ls /var/lib/vz/template/cache/debian-*-standard_*.tar.zst 2>/dev/null))
 if [ ${#TEMPLATES[@]} -eq 0 ]; then
-    echo "Kein Debian-Template gefunden. Bitte zuerst ein Template in /var/lib/vz/template/cache/ ablegen."
+    whiptail --title "Fehler" --msgbox "Kein Debian-Template gefunden.\nBitte zuerst ein Template in /var/lib/vz/template/cache/ ablegen." 10 60
     exit 1
 fi
-
-# Template-Auswahl
-TEMPLATE=$(whiptail --title "Debian Template auswählen" --menu "Wähle ein Template für den Container:" 15 60 4 \
-$(for t in "${TEMPLATES[@]}"; do echo "$t $(basename $t)"; done) \
-3>&1 1>&2 2>&3)
+MENU_TEMPLATES=()
+for t in "${TEMPLATES[@]}"; do
+    MENU_TEMPLATES+=("$t" "$(basename $t)")
+done
+TEMPLATE=$(whiptail --title "Debian Template auswählen" --menu "Wähle ein Template für den Container:" 15 60 4 "${MENU_TEMPLATES[@]}" 3>&1 1>&2 2>&3)
 
 # Schritt 2: Storage auswählen
 STORAGES=($(pvesm status | awk 'NR>1 {print $1}'))
-STORAGE=$(whiptail --title "Storage auswählen" --menu "Wähle einen Storage für den Container:" 15 60 4 \
-$(for s in "${STORAGES[@]}"; do echo "$s $s"; done) \
-3>&1 1>&2 2>&3)
+MENU_STORAGES=()
+for s in "${STORAGES[@]}"; do
+    MENU_STORAGES+=("$s" "$s")
+done
+STORAGE=$(whiptail --title "Storage auswählen" --menu "Wähle einen Storage für den Container:" 15 60 4 "${MENU_STORAGES[@]}" 3>&1 1>&2 2>&3)
 
 # Schritt 3: CTID festlegen
 CTID=$(whiptail --title "Container ID" --inputbox "Gib die CTID für den neuen Container ein:" 8 40 "112" 3>&1 1>&2 2>&3)
 
-# Schritt 4: IP-Modus auswählen
+# Schritt 4: SSH Passwort festlegen
+SSH_PASS=$(whiptail --title "SSH Passwort" --passwordbox "Gib ein Passwort für den Container ein:" 8 40 3>&1 1>&2 2>&3)
+
+# Schritt 5: IP-Modus auswählen
 IP_MODE=$(whiptail --title "Netzwerk Modus" --menu "Wähle IP-Konfiguration:" 15 60 4 \
 "dhcp" "DHCP" \
 "static" "Feste IP" \
@@ -38,32 +47,43 @@ if [ "$IP_MODE" == "static" ]; then
     GATEWAY=$(whiptail --title "Gateway" --inputbox "Gib das Gateway ein:" 8 40 "192.168.1.1" 3>&1 1>&2 2>&3)
 fi
 
-# Schritt 5: SSH Passwort abfragen
-SSH_PASS=$(whiptail --title "SSH Passwort" --passwordbox "Gib das Passwort für den Container ein:" 8 40 3>&1 1>&2 2>&3)
-
-# Schritt 6: Container erstellen
-echo "Erstelle LXC Container..."
-NET_CONF="name=eth0,bridge=vmbr0,ip=dhcp"
-if [ "$IP_MODE" == "static" ]; then
+# Netzwerk-Konfiguration ohne VLAN
+if [ "$IP_MODE" == "dhcp" ]; then
+    NET_CONF="name=eth0,bridge=vmbr0,ip=dhcp"
+else
     NET_CONF="name=eth0,bridge=vmbr0,ip=$IP,gw=$GATEWAY"
 fi
 
-pct create $CTID $TEMPLATE --storage $STORAGE --net0 $NET_CONF --ostype debian --hostname frigate-$CTID --features nesting=1
-pct set $CTID --password $SSH_PASS
+# Schritt 6: Container erstellen
+whiptail --title "Container erstellen" --msgbox "Erstelle LXC Container $CTID..." 8 60
+pct create $CTID $TEMPLATE \
+    --storage $STORAGE \
+    --net0 $NET_CONF \
+    --ostype debian \
+    --hostname frigate-$CTID \
+    --features nesting=1 \
+    --password "$SSH_PASS"
 
 # Schritt 7: Container starten
 pct start $CTID
+whiptail --title "Container gestartet" --msgbox "Container $CTID wurde gestartet." 8 60
 
-# Schritt 8: Docker und Frigate installieren
-echo "Installiere Docker und Frigate im Container..."
-pct exec $CTID -- bash -c 'apt update && apt install -y curl gnupg lsb-release locales && locale-gen en_US.UTF-8 && update-locale LANG=en_US.UTF-8'
-pct exec $CTID -- bash -c 'curl -fsSL https://get.docker.com | sh'
+# Schritt 8: Locale setzen
+pct exec $CTID -- bash -c "apt update && apt install -y locales && locale-gen en_US.UTF-8 && update-locale LANG=en_US.UTF-8"
 
-# Frigate Repository in Container klonen
-pct exec $CTID -- bash -c 'mkdir -p /opt/frigate && git clone https://github.com/sebrosch/frigate.git /opt/frigate --branch main'
+# Schritt 9: Docker und Docker Compose installieren
+whiptail --title "Docker Installation" --msgbox "Installiere Docker und Docker Compose im Container..." 8 60
+pct exec $CTID -- bash -c "apt update && apt install -y curl gnupg lsb-release && \
+  curl -fsSL https://get.docker.com | sh && \
+  apt install -y docker-compose-plugin"
 
-# Starte Frigate
-pct exec $CTID -- bash -c 'cd /opt/frigate && docker-compose up -d'
+# Schritt 10: Frigate Repository klonen
+whiptail --title "Frigate Repository" --msgbox "Klonen Frigate-Repository im Container..." 8 60
+pct exec $CTID -- bash -c "mkdir -p /opt/frigate && git clone https://github.com/sebrosch/frigate.git /opt/frigate --branch main"
 
-echo "Frigate läuft jetzt im Container $CTID."
-echo "Zugriff: http://<IP>:5000"
+# Schritt 11: Frigate starten
+whiptail --title "Frigate starten" --msgbox "Starte Frigate im Container..." 8 60
+pct exec $CTID -- bash -c "cd /opt/frigate && docker compose up -d"
+
+# Fertigmeldung
+whiptail --title "Fertig" --msgbox "Frigate läuft jetzt im Container $CTID.\nZugriff: http://<IP>:5000" 10 60
