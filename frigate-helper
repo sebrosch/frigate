@@ -1,33 +1,28 @@
 #!/bin/bash
 
-# --- Voraussetzungen prüfen ---
+# -----------------------------------------------
+# Frigate Helper für Proxmox
+# -----------------------------------------------
+
+# Prüfen, ob whiptail installiert ist
 if ! command -v whiptail &> /dev/null; then
     echo "whiptail wird benötigt. Installiere es..."
     apt update && apt install -y whiptail
 fi
 
-# --- Schritt 1: Debian-Template automatisch finden ---
-TEMPLATES=($(ls /var/lib/vz/template/cache/debian-*-standard_*.tar.zst 2>/dev/null))
-if [ ${#TEMPLATES[@]} -eq 0 ]; then
-    echo "Kein Debian-Template gefunden. Bitte zuerst ein Template in /var/lib/vz/template/cache/ ablegen."
-    exit 1
-fi
+# SSH Passwort für Container abfragen
+CONTAINER_PASSWORD=$(whiptail --title "SSH Passwort" --passwordbox "Bitte gib das gewünschte SSH Passwort für den Container ein:" 10 60 3>&1 1>&2 2>&3)
 
-TEMPLATE=$(whiptail --title "Debian Template auswählen" --menu "Wähle ein Template für den Container:" 15 60 4 \
-$(for t in "${TEMPLATES[@]}"; do echo "$t $(basename $t)"; done) \
-3>&1 1>&2 2>&3)
-
-# --- Schritt 2: Storage auswählen ---
+# Storage auswählen
 STORAGES=($(pvesm status | awk 'NR>1 {print $1}'))
 STORAGE=$(whiptail --title "Storage auswählen" --menu "Wähle einen Storage für den Container:" 15 60 4 \
 $(for s in "${STORAGES[@]}"; do echo "$s $s"; done) \
 3>&1 1>&2 2>&3)
 
-# --- Schritt 3: CTID und Passwort ---
+# CTID auswählen
 CTID=$(whiptail --title "Container ID" --inputbox "Gib die CTID für den neuen Container ein:" 8 40 "112" 3>&1 1>&2 2>&3)
-SSH_PASS=$(whiptail --title "Root Passwort" --passwordbox "Gib das Root-Passwort für den Container ein:" 8 40 3>&1 1>&2 2>&3)
 
-# --- Schritt 4: IP-Modus ---
+# IP-Modus auswählen
 IP_MODE=$(whiptail --title "Netzwerk Modus" --menu "Wähle IP-Konfiguration:" 15 60 4 \
 "dhcp" "DHCP" \
 "static" "Feste IP" \
@@ -38,43 +33,47 @@ if [ "$IP_MODE" == "static" ]; then
     GATEWAY=$(whiptail --title "Gateway" --inputbox "Gib das Gateway ein:" 8 40 "192.168.1.1" 3>&1 1>&2 2>&3)
 fi
 
-# --- Schritt 5: Container erstellen ---
+# Debian-Template prüfen / herunterladen
+TEMPLATE_DIR="/var/lib/vz/template/cache"
+DEBIAN_TEMPLATE=$(ls $TEMPLATE_DIR/debian-*-standard_*.tar.zst 2>/dev/null | head -n 1)
+
+if [ -z "$DEBIAN_TEMPLATE" ]; then
+    echo "Kein Debian-Template gefunden. Lade es automatisch herunter..."
+    pveam update
+    pveam download local debian-12-standard_12.7-1_amd64
+    DEBIAN_TEMPLATE=$(ls $TEMPLATE_DIR/debian-*-standard_*.tar.zst 2>/dev/null | head -n 1)
+    if [ -z "$DEBIAN_TEMPLATE" ]; then
+        echo "Fehler: Template konnte nicht heruntergeladen werden."
+        exit 1
+    fi
+fi
+
+# Container erstellen
 echo "Erstelle LXC Container..."
 if [ "$IP_MODE" == "dhcp" ]; then
-    pct create $CTID $TEMPLATE --storage $STORAGE --net0 name=eth0,bridge=vmbr0,ip=dhcp --ostype debian --hostname frigate-$CTID --features nesting=1
+    pct create $CTID $DEBIAN_TEMPLATE --storage $STORAGE --net0 name=eth0,bridge=vmbr0,ip=dhcp --ostype debian --hostname frigate-$CTID --features nesting=1 --password $CONTAINER_PASSWORD
 else
-    pct create $CTID $TEMPLATE --storage $STORAGE --net0 name=eth0,bridge=vmbr0,ip=$IP,gw=$GATEWAY --ostype debian --hostname frigate-$CTID --features nesting=1
+    pct create $CTID $DEBIAN_TEMPLATE --storage $STORAGE --net0 name=eth0,bridge=vmbr0,ip=$IP,gw=$GATEWAY --ostype debian --hostname frigate-$CTID --features nesting=1 --password $CONTAINER_PASSWORD
 fi
 
+# Container starten
 pct start $CTID
 
-# --- Schritt 6: Root-Passwort setzen ---
-pct exec $CTID -- bash -c "echo 'root:$SSH_PASS' | chpasswd"
+# Docker und Frigate installieren
+echo "Installiere Docker im Container..."
+pct exec $CTID -- bash -c "apt update && apt install -y curl gnupg lsb-release && curl -fsSL https://get.docker.com | sh"
 
-# --- Schritt 7: Locale konfigurieren ---
-pct exec $CTID -- bash -c "apt update && apt install -y locales && locale-gen en_US.UTF-8 && update-locale LANG=en_US.UTF-8"
+echo "Klonen Frigate-Repository im Container..."
+pct exec $CTID -- bash -c "mkdir -p /opt && git clone https://github.com/sebrosch/frigate.git /opt/frigate --branch main"
 
-# --- Schritt 8: Docker installieren ---
-pct exec $CTID -- bash -c "apt update --allow-releaseinfo-change && apt install -y curl gnupg lsb-release ca-certificates"
-pct exec $CTID -- bash -c "curl -fsSL https://get.docker.com | sh"
+echo "Frigate im Container starten..."
+pct exec $CTID -- bash -c "cd /opt/frigate && docker-compose up -d"
 
-# --- Schritt 9: Frigate ins Container kopieren ---
-pct exec $CTID -- mkdir -p /opt/frigate
-pct exec $CTID -- bash -c "apt install -y git && git clone https://github.com/sebrosch/frigate.git /opt/frigate --branch main"
-
-# --- Schritt 10: Frigate starten ---
-pct exec $CTID -- bash -c "cd /opt/frigate && docker compose up -d"
-
-# --- Schritt 11: Host aufräumen ---
+# Host aufräumen
+echo "🔹 Starte Aufräumen auf dem Host..."
 rm -rf /opt/frigate
-rm -f /var/lib/vz/template/cache/$(basename $TEMPLATE)
+rm -f /var/lib/vz/template/cache/debian-12-standard_12.7-1_amd64.tar.zst
+echo "✅ Host-Aufräumen abgeschlossen."
 
-# --- Schritt 12: Container-IP ermitteln ---
-if [ "$IP_MODE" == "dhcp" ]; then
-    CONTAINER_IP=$(pct exec $CTID -- hostname -I | awk '{print $1}')
-else
-    CONTAINER_IP=$IP
-fi
-
-echo "✅ Frigate läuft jetzt im Container $CTID."
-echo "Zugriff: http://$CONTAINER_IP:5000"
+echo "Frigate läuft jetzt im Container $CTID."
+echo "Zugriff: http://<IP>:5000"
