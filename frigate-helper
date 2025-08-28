@@ -1,0 +1,158 @@
+#!/bin/bash
+
+# -------------------------------
+# Proxmox Frigate Helper mit HW-Erkennung
+# -------------------------------
+
+CT_TEMPLATE="local:vztmpl/debian-12-standard_12.0-1_amd64.tar.zst"
+STORAGE="local-lvm"
+DISK_SIZE="30"
+MEMORY="4096"
+SWAP="512"
+CPUS="2"
+BRIDGE="vmbr0"
+
+function detect_hw() {
+    DEVICES=""
+    # Intel iGPU prüfen
+    if ls /dev/dri/card0 &>/dev/null; then
+        DEVICES="$DEVICES\n      - /dev/dri:/dev/dri"
+        echo "✅ Intel iGPU gefunden"
+    fi
+
+    # Coral USB prüfen
+    if lsusb | grep -i "Global Unichip" &>/dev/null; then
+        DEVICES="$DEVICES\n      - /dev/bus/usb/$(lsusb | grep -i 'Global Unichip' | awk '{print $2"/"$4}' | sed 's/://'):/dev/bus/usb/$(lsusb | grep -i 'Global Unichip' | awk '{print $2"/"$4}' | sed 's/://')"
+        echo "✅ Coral USB TPU gefunden"
+    fi
+    echo -e "$DEVICES"
+}
+
+function create_frigate() {
+    CTID=$(pvesh get /cluster/nextid)
+    HOSTNAME="frigate"
+
+    # Storage Typ prüfen
+    STORAGE_TYPE=$(pvesh get /storage/$STORAGE 2>/dev/null | grep -o '"type":"[^"]*' | cut -d'"' -f4)
+    if [[ "$STORAGE_TYPE" != "dir" && "$STORAGE_TYPE" != "lvmthin" ]]; then
+        echo "⚠️  Storage $STORAGE hat unbekannten Typ ($STORAGE_TYPE)"
+        exit 1
+    fi
+    ROOTFS="$STORAGE:$DISK_SIZE"
+
+    echo "Erstelle Frigate LXC (CTID=$CTID)..."
+    pct create $CTID $CT_TEMPLATE \
+        --hostname $HOSTNAME \
+        --rootfs $ROOTFS \
+        --memory $MEMORY \
+        --swap $SWAP \
+        --cores $CPUS \
+        --net0 name=eth0,bridge=$BRIDGE,ip=dhcp \
+        --features nesting=1 \
+        --unprivileged 0
+
+    pct start $CTID
+    sleep 10
+
+    echo "Installiere Pakete und Docker..."
+    pct exec $CTID -- bash -c "apt update && apt upgrade -y"
+    pct exec $CTID -- bash -c "apt install -y curl sudo git apt-transport-https ca-certificates software-properties-common net-tools"
+    pct exec $CTID -- bash -c "curl -fsSL https://get.docker.com | sh"
+    pct exec $CTID -- bash -c "apt install -y docker-compose-plugin"
+    pct exec $CTID -- bash -c "systemctl enable --now docker"
+
+    echo "Lege Frigate-Verzeichnisse an..."
+    pct exec $CTID -- bash -c "mkdir -p /opt/frigate/config /opt/frigate/media"
+
+    # Hardware erkennen
+    DEVICES=$(detect_hw)
+
+    # Docker-Compose erstellen
+    pct exec $CTID -- bash -c "cat > /opt/frigate/docker-compose.yml <<EOF
+version: \"3.9\"
+services:
+  frigate:
+    container_name: frigate
+    restart: unless-stopped
+    privileged: true
+    image: ghcr.io/blakeblackshear/frigate:stable
+    shm_size: \"64mb\"$DEVICES
+    volumes:
+      - ./config:/config
+      - /etc/localtime:/etc/localtime:ro
+      - ./media:/media/frigate
+    ports:
+      - \"5000:5000\"
+      - \"8554:8554\"
+      - \"8555:8555/tcp\"
+      - \"8555:8555/udp\"
+EOF"
+
+    # config.yml
+    pct exec $CTID -- bash -c "cat > /opt/frigate/config/config.yml <<'EOF'
+mqtt:
+  host: 192.168.1.10
+  user: mqttuser
+  password: mqttpass
+
+cameras:
+  haustuer:
+    ffmpeg:
+      inputs:
+        - path: rtsp://user:pass@192.168.1.20:554/stream1
+          roles:
+            - detect
+            - rtmp
+    detect:
+      width: 1920
+      height: 1080
+      fps: 5
+EOF"
+
+    # MOTD: IP + Port
+    pct exec $CTID -- bash -c "cat > /etc/profile.d/frigate-info.sh <<'EOF'
+#!/bin/bash
+IP=\$(hostname -I | awk '{print \$1}')
+echo \"-----------------------------------\"
+echo \" Frigate läuft im Container!\"
+echo \" Zugriff: http://\$IP:5000\"
+echo \"-----------------------------------\"
+EOF"
+    pct exec $CTID -- chmod +x /etc/profile.d/frigate-info.sh
+
+    # Frigate direkt starten
+    pct exec $CTID -- bash -c "cd /opt/frigate && docker compose up -d"
+
+    echo "-----------------------------------"
+    echo "✅ Frigate LXC erstellt und gestartet!"
+    echo "CTID: $CTID"
+    echo "Login: pct enter $CTID"
+    echo "Frigate Web-UI: http://<IP_des_Containers>:5000"
+    echo "-----------------------------------"
+}
+
+function list_containers() {
+    pct list
+}
+
+function usage() {
+    echo "Usage: $0 {create|list}"
+    exit 1
+}
+
+# Parameter prüfen
+if [ $# -lt 1 ]; then
+    usage
+fi
+
+case "$1" in
+    create)
+        create_frigate
+        ;;
+    list)
+        list_containers
+        ;;
+    *)
+        usage
+        ;;
+esac
