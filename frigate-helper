@@ -1,17 +1,14 @@
 #!/bin/bash
 
 # ---------------------------
-# Frigate Helper Script v2.0
-# Features:
-# - Storage Option
-# - Help-Menü
-# - Prüft und lädt fehlendes LXC-Template
-# - Löscht ggf. alte Container und /opt/frigate
+# Frigate Helper Script v4.0 (öffentlich)
+# Automatisierte Installation auf Proxmox LXC
 # ---------------------------
 
 STORAGE="local-lvm"
-TEMPLATE="/var/lib/vz/template/cache/debian-12-standard_12.2-1_amd64.tar.gz"
+TEMPLATE="debian-12-standard_12.2-1_amd64.tar.gz"
 FRIGATE_DIR="/opt/frigate"
+GITHUB_REPO="frigate"
 
 show_help() {
     echo "Usage: $0 create [--storage STORAGE_NAME]"
@@ -50,23 +47,22 @@ fi
 echo "=== Starte Frigate Installation ==="
 echo "Verwende Storage: $STORAGE"
 
-# Prüfen, ob /opt/frigate existiert
+# Prüfen /opt/frigate
 if [ -d "$FRIGATE_DIR" ]; then
     echo "Altes /opt/frigate Verzeichnis gefunden, lösche es..."
     rm -rf "$FRIGATE_DIR"
 fi
 
-# Git-Klon erstellen
-echo "Klonen des Repos..."
-git clone git@github.com:sebrosch/frigate.git "$FRIGATE_DIR" --branch main
-
+# Repo klonen (öffentlich, ohne PAT)
+echo "Klonen des öffentlichen Repos..."
+git clone https://github.com/sebrosch/$GITHUB_REPO.git "$FRIGATE_DIR" --branch main
 chmod +x "$FRIGATE_DIR/frigate-helper"
 
-# Prüfen, ob LXC-Template existiert
-if [ ! -f "$TEMPLATE" ]; then
+# LXC Template prüfen und ggf. laden
+if [ ! -f "/var/lib/vz/template/cache/$TEMPLATE" ]; then
     echo "LXC Template fehlt, lade es herunter..."
     pveam update
-    pveam download local debian-12-standard_12.2-1_amd64.tar.gz
+    pveam download $STORAGE $TEMPLATE
 fi
 
 # CTID ermitteln
@@ -80,9 +76,9 @@ if pct status $NEXT_CID &>/dev/null; then
     pct destroy $NEXT_CID
 fi
 
-# LXC erstellen
+# Container erstellen
 echo "Erstelle Container..."
-pct create $NEXT_CID "$TEMPLATE" \
+pct create $NEXT_CID "/var/lib/vz/template/cache/$TEMPLATE" \
     --storage $STORAGE \
     --hostname frigate \
     --cores 2 \
@@ -95,7 +91,7 @@ pct create $NEXT_CID "$TEMPLATE" \
 
 pct start $NEXT_CID
 
-# Docker installieren
+# Docker & Git installieren
 echo "Installiere Docker im Container..."
 pct exec $NEXT_CID -- bash -c "apt update && apt install -y docker.io docker-compose git"
 
