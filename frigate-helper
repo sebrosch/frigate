@@ -1,76 +1,81 @@
 #!/bin/bash
-# Frigate Helper für Proxmox LXC
-# Interaktives Menü für Template, Storage und IP + automatische Docker & Frigate Installation
-
 set -e
 
-# Prüfe ob whiptail installiert ist
-if ! command -v whiptail &> /dev/null; then
-    apt update && apt install -y whiptail
-fi
-
-# Schritt 1: LXC Templates automatisch suchen
-TEMPLATES=($(ls /var/lib/vz/template/cache/debian-*.tar.zst 2>/dev/null | xargs -n1 basename))
+# 1️⃣ Templates finden
+TEMPLATES=($(ls /var/lib/vz/template/cache/debian-*-standard_*.tar.zst 2>/dev/null))
 if [ ${#TEMPLATES[@]} -eq 0 ]; then
-    echo "Keine Debian LXC Templates gefunden! Bitte Template in /var/lib/vz/template/cache/ ablegen."
+    echo "Keine Debian-Templates gefunden unter /var/lib/vz/template/cache/"
     exit 1
 fi
 
-# Menü für Template
-MENU_OPTIONS=()
-for t in "${TEMPLATES[@]}"; do
-    MENU_OPTIONS+=("$t" "")
+echo "Gefundene Debian-Templates:"
+select TEMPLATE in "${TEMPLATES[@]}"; do
+    if [ -n "$TEMPLATE" ]; then
+        echo "Ausgewählt: $TEMPLATE"
+        break
+    fi
 done
 
-SELECTED_TEMPLATE=$(whiptail --title "Debian Template Auswahl" --menu "Wähle ein LXC Template:" 20 60 10 "${MENU_OPTIONS[@]}" 3>&1 1>&2 2>&3)
-
-# Schritt 2: Storage Auswahl
+# 2️⃣ Storage auswählen
 STORAGES=($(pvesm status | awk 'NR>1 {print $1}'))
-MENU_STORAGE=()
-for s in "${STORAGES[@]}"; do
-    MENU_STORAGE+=("$s" "")
+echo "Verfügbare Storage:"
+select STORAGE in "${STORAGES[@]}"; do
+    if [ -n "$STORAGE" ]; then
+        echo "Container wird auf Storage $STORAGE erstellt"
+        break
+    fi
 done
 
-SELECTED_STORAGE=$(whiptail --title "Storage Auswahl" --menu "Wähle den Storage für den Container:" 20 60 10 "${MENU_STORAGE[@]}" 3>&1 1>&2 2>&3)
+# 3️⃣ Container-ID abfragen
+read -p "CTID für den Container: " CTID
 
-# Schritt 3: DHCP oder feste IP
-IP_MODE=$(whiptail --title "IP Konfiguration" --menu "Wie soll der Container seine IP bekommen?" 15 60 2 \
-"dhcp" "DHCP (automatisch)" \
-"static" "Feste IP" 3>&1 1>&2 2>&3)
+# 4️⃣ DHCP oder statische IP
+echo "Netzwerkmodus wählen:"
+select NETMODE in "DHCP" "Static"; do
+    if [ "$NETMODE" == "DHCP" ]; then
+        IP_CONF=""
+        break
+    elif [ "$NETMODE" == "Static" ]; then
+        read -p "Statische IP (z.B. 192.168.1.100/24): " STATIC_IP
+        read -p "Gateway (z.B. 192.168.1.1): " GATEWAY
+        IP_CONF="--net0 name=eth0,bridge=vmbr0,ip=$STATIC_IP,gw=$GATEWAY"
+        break
+    fi
+done
 
-if [ "$IP_MODE" = "static" ]; then
-    STATIC_IP=$(whiptail --inputbox "Gib die feste IP ein (z.B. 192.168.1.50/24):" 10 60 3>&1 1>&2 2>&3)
-fi
+# 5️⃣ Container erstellen
+echo "Erstelle LXC Container $CTID..."
+pct create $CTID $TEMPLATE --storage $STORAGE $IP_CONF --hostname frigate-$CTID --password root
 
-# Schritt 4: Nächste freie CTID ermitteln
-CTID=$(pvesh get /cluster/nextid)
+# 6️⃣ Locale fixen
+pct exec $CTID -- bash -c "
+apt update && apt install -y locales
+locale-gen en_US.UTF-8
+update-locale LANG=en_US.UTF-8
+"
 
-# Schritt 5: Container erstellen
-echo "Erstelle LXC Container $CTID mit Template $SELECTED_TEMPLATE auf Storage $SELECTED_STORAGE..."
-if [ "$IP_MODE" = "dhcp" ]; then
-    pct create $CTID /var/lib/vz/template/cache/$SELECTED_TEMPLATE -storage $SELECTED_STORAGE -hostname frigate-$CTID -net0 name=eth0,bridge=vmbr0,ip=dhcp -cores 2 -memory 2048
-else
-    pct create $CTID /var/lib/vz/template/cache/$SELECTED_TEMPLATE -storage $SELECTED_STORAGE -hostname frigate-$CTID -net0 name=eth0,bridge=vmbr0,ip=$STATIC_IP -cores 2 -memory 2048
-fi
+# 7️⃣ Docker installieren
+pct exec $CTID -- bash -c "
+apt update && apt install -y ca-certificates curl gnupg
+mkdir -p /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable' > /etc/apt/sources.list.d/docker.list
+apt update
+apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+systemctl enable docker
+systemctl start docker
+"
 
-# Container starten
-pct start $CTID
-
-echo "Warte bis der Container hochgefahren ist..."
-sleep 15
-
-# Schritt 6: Docker im Container installieren
-echo "Installiere Docker im Container..."
-pct exec $CTID -- bash -c "apt update && apt install -y ca-certificates curl gnupg lsb-release"
-pct exec $CTID -- bash -c "mkdir -p /etc/apt/keyrings && curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg"
-pct exec $CTID -- bash -c "echo \"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable\" > /etc/apt/sources.list.d/docker.list"
-pct exec $CTID -- bash -c "apt update && apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin"
-
-# Schritt 7: Frigate starten
-echo "Starte Frigate Container..."
-pct exec $CTID -- docker run -d --name frigate --restart unless-stopped -p 5000:5000 blakeblackshear/frigate:stable
+# 8️⃣ Frigate installieren
+pct exec $CTID -- bash -c "
+apt update && apt install -y git jq
+git clone https://github.com/blakeblackshear/frigate.git /opt/frigate
+cd /opt/frigate
+docker compose up -d
+"
 
 echo "-----------------------------------"
-echo "Frigate LXC Container $CTID wurde erstellt und gestartet!"
-echo "Zugriff: http://<IP>:5000"
+echo "Frigate Container erstellt und gestartet!"
+echo "CTID: $CTID"
+echo "Zugriff: http://<Container-IP>:5000"
 echo "-----------------------------------"
