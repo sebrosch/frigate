@@ -1,78 +1,75 @@
 #!/bin/bash
 
-# -----------------------------------------------
-# Frigate Helper für Proxmox
-# -----------------------------------------------
-
-# Prüfen, ob whiptail installiert ist
+# whiptail installieren falls nicht vorhanden
 if ! command -v whiptail &> /dev/null; then
-    echo "whiptail wird benötigt. Installiere es..."
     apt update && apt install -y whiptail
 fi
 
-# SSH Passwort für Container abfragen
-CONTAINER_PASSWORD=$(whiptail --title "SSH Passwort" --passwordbox "Bitte gib das gewünschte SSH Passwort für den Container ein:" 10 60 3>&1 1>&2 2>&3)
+# Schritt 1: Template prüfen oder herunterladen
+TEMPLATE_DIR="/var/lib/vz/template/cache"
+TEMPLATE_FILE=$(ls $TEMPLATE_DIR/debian-*-standard_*.tar.zst 2>/dev/null | head -n1)
 
-# Storage auswählen
-STORAGES=($(pvesm status | awk 'NR>1 {print $1}'))
-STORAGE=$(whiptail --title "Storage auswählen" --menu "Wähle einen Storage für den Container:" 15 60 4 \
-$(for s in "${STORAGES[@]}"; do echo "$s $s"; done) \
+if [ -z "$TEMPLATE_FILE" ]; then
+    echo "Kein Debian-Template gefunden. Lade Standard Debian 12 Template..."
+    wget -P $TEMPLATE_DIR https://downloads.openvz.org/template/precreated/debian-12.11-standard_12.11-1_amd64.tar.zst
+    TEMPLATE_FILE=$(ls $TEMPLATE_DIR/debian-*-standard_*.tar.zst | head -n1)
+fi
+
+# Template auswählen (falls mehrere vorhanden)
+TEMPLATE=$(whiptail --title "Debian Template auswählen" --menu "Wähle ein Template für den Container:" 15 60 4 \
+$(for t in $(ls $TEMPLATE_DIR/debian-*-standard_*.tar.zst); do echo "$t $(basename $t)"; done) \
 3>&1 1>&2 2>&3)
 
-# CTID auswählen
+# Schritt 2: Storage auswählen
+STORAGE=$(whiptail --title "Storage auswählen" --inputbox "Gib den Storage für den Container ein:" 8 40 "local-lvm" 3>&1 1>&2 2>&3)
+
+# Schritt 3: CTID festlegen
 CTID=$(whiptail --title "Container ID" --inputbox "Gib die CTID für den neuen Container ein:" 8 40 "112" 3>&1 1>&2 2>&3)
 
-# IP-Modus auswählen
+# Schritt 4: IP-Modus auswählen
 IP_MODE=$(whiptail --title "Netzwerk Modus" --menu "Wähle IP-Konfiguration:" 15 60 4 \
 "dhcp" "DHCP" \
 "static" "Feste IP" \
 3>&1 1>&2 2>&3)
 
 if [ "$IP_MODE" == "static" ]; then
-    IP=$(whiptail --title "Feste IP" --inputbox "Gib die feste IP-Adresse für den Container ein:" 8 40 "192.168.1.100/24" 3>&1 1>&2 2>&3)
+    IP=$(whiptail --title "Feste IP" --inputbox "Gib die feste IP-Adresse ein:" 8 40 "192.168.1.100/24" 3>&1 1>&2 2>&3)
     GATEWAY=$(whiptail --title "Gateway" --inputbox "Gib das Gateway ein:" 8 40 "192.168.1.1" 3>&1 1>&2 2>&3)
 fi
 
-# Debian-Template prüfen / herunterladen
-TEMPLATE_DIR="/var/lib/vz/template/cache"
-DEBIAN_TEMPLATE=$(ls $TEMPLATE_DIR/debian-*-standard_*.tar.zst 2>/dev/null | head -n 1)
-
-if [ -z "$DEBIAN_TEMPLATE" ]; then
-    echo "Kein Debian-Template gefunden. Lade es automatisch herunter..."
-    pveam update
-    pveam download local debian-12-standard_12.7-1_amd64
-    DEBIAN_TEMPLATE=$(ls $TEMPLATE_DIR/debian-*-standard_*.tar.zst 2>/dev/null | head -n 1)
-    if [ -z "$DEBIAN_TEMPLATE" ]; then
-        echo "Fehler: Template konnte nicht heruntergeladen werden."
-        exit 1
-    fi
+# Schritt 5: optionales SSH-Passwort
+SET_SSH=$(whiptail --title "SSH Passwort" --yesno "Möchtest du ein SSH Passwort setzen?" 8 60 3>&1 1>&2 2>&3)
+if [ $? -eq 0 ]; then
+    SSHPASS=$(whiptail --title "SSH Passwort" --passwordbox "Gib ein SSH Passwort ein:" 8 40 3>&1 1>&2 2>&3)
 fi
 
-# Container erstellen
-echo "Erstelle LXC Container..."
+# Schritt 6: Container erstellen
 if [ "$IP_MODE" == "dhcp" ]; then
-    pct create $CTID $DEBIAN_TEMPLATE --storage $STORAGE --net0 name=eth0,bridge=vmbr0,ip=dhcp --ostype debian --hostname frigate-$CTID --features nesting=1 --password $CONTAINER_PASSWORD
+    pct create $CTID $TEMPLATE --storage $STORAGE --net0 name=eth0,bridge=vmbr0,ip=dhcp --ostype debian --hostname frigate-$CTID --features nesting=1
 else
-    pct create $CTID $DEBIAN_TEMPLATE --storage $STORAGE --net0 name=eth0,bridge=vmbr0,ip=$IP,gw=$GATEWAY --ostype debian --hostname frigate-$CTID --features nesting=1 --password $CONTAINER_PASSWORD
+    pct create $CTID $TEMPLATE --storage $STORAGE --net0 name=eth0,bridge=vmbr0,ip=$IP,gw=$GATEWAY --ostype debian --hostname frigate-$CTID --features nesting=1
 fi
 
-# Container starten
+# Schritt 7: SSH Passwort setzen falls gewählt
+if [ ! -z "$SSHPASS" ]; then
+    pct set $CTID --password $SSHPASS
+fi
+
+# Schritt 8: Container starten
 pct start $CTID
 
-# Docker und Frigate installieren
-echo "Installiere Docker im Container..."
-pct exec $CTID -- bash -c "apt update && apt install -y curl gnupg lsb-release && curl -fsSL https://get.docker.com | sh"
+# Schritt 9: Docker und Docker Compose Plugin installieren
+pct exec $CTID -- bash -c "apt update && apt install -y curl gnupg lsb-release && curl -fsSL https://get.docker.com | sh && apt install -y docker-compose-plugin"
 
-echo "Klonen Frigate-Repository im Container..."
+# Schritt 10: Frigate klonen
 pct exec $CTID -- bash -c "mkdir -p /opt && git clone https://github.com/sebrosch/frigate.git /opt/frigate --branch main"
 
-echo "Frigate im Container starten..."
-pct exec $CTID -- bash -c "cd /opt/frigate && docker-compose up -d"
+# Schritt 11: Frigate starten
+pct exec $CTID -- bash -c "cd /opt/frigate && docker compose up -d"
 
-# Host aufräumen
+# Schritt 12: Host-Aufräumen (nur temporäre Dateien)
 echo "🔹 Starte Aufräumen auf dem Host..."
 rm -rf /opt/frigate
-rm -f /var/lib/vz/template/cache/debian-12-standard_12.7-1_amd64.tar.zst
 echo "✅ Host-Aufräumen abgeschlossen."
 
 echo "Frigate läuft jetzt im Container $CTID."
